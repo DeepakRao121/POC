@@ -1,0 +1,65 @@
+{
+	"StartAt": "DescribeInstances",
+	"States": {
+	  "DescribeInstances": {
+		"Type": "Task",
+		"Resource": "${AuditDStatusMonitorFunction1ARN}",
+		"Next": "ProcessInstances",
+		"Retry": [
+		  {
+			"ErrorEquals": [
+			  "Lambda.ServiceException",
+			  "Lambda.AWSLambdaException",
+			  "Lambda.SdkClientException",
+			  "Lambda.TooManyRequestsException",
+			  "SSHException",
+			  "ConnectionResetError",
+			  "paramiko.ssh_exception.SSHException"
+			],
+			"IntervalSeconds": 15,
+			"MaxAttempts": 3,
+			"BackoffRate": 2
+		  }
+		]
+	  },
+	  "ProcessInstances": {
+		"Type": "Map",
+		"ItemProcessor": {
+		  "ProcessorConfig": {
+			"Mode": "INLINE"
+		  },
+		  "StartAt": "CheckAuditStatus",
+		  "States": {
+			"CheckAuditStatus": {
+			  "Type": "Task",
+			  "Resource": "${AuditDStatusMonitorFunction1ARN}",
+			  "Retry": [
+				{
+				  "Comment": "Handle SSH Banner and Network Errors",
+				  "ErrorEquals": [
+					"SSHException",
+					"paramiko.ssh_exception.SSHException"
+				  ],
+				  "IntervalSeconds": 10,
+				  "MaxAttempts": 3,
+				  "BackoffRate": 2
+				},
+				{
+				  "Comment": "Handle Lambda service-level hiccups",
+				  "ErrorEquals": [
+					"Lambda.TooManyRequestsException",
+					"Lambda.ServiceException"
+				  ],
+				  "IntervalSeconds": 5,
+				  "MaxAttempts": 2,
+				  "BackoffRate": 2
+				}
+			  ],
+			  "End": true
+			}
+		  }
+		},
+		"End": true
+	  }
+	}
+  }
