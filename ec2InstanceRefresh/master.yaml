@@ -1,0 +1,168 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Transform: AWS::Serverless-2016-10-31
+
+Description: "Cloudformation template to setup system for EC2 intstance rotation."
+
+Parameters:
+  EnvironmentType:
+    Type: String
+    Description: Environment of Deployment
+    AllowedValues: [ 'dev', 'qa', 'qa2', 'uat', 'int', 'int2', 'production' ]
+
+Mappings:
+  EnvironmentToBucket:
+    qa2:
+      BucketName: "cfn-templates-v2-ap-south-1-qa2"
+    int:
+      BucketName: "cfn-templates-v2-int"
+    int2:
+      BucketName: "cfn-templates-v2-ap-south-1-int2"
+    production:
+      BucketName: "cfn-oneaboveall-templates-production"
+  
+Conditions:
+  EnvironmentProd:
+    !Equals [ !Ref EnvironmentType, "production" ]
+  EnvironmentInt:
+    !Equals [ !Ref EnvironmentType, "int" ]
+  EnvironmentInt2:
+    !Equals [ !Ref EnvironmentType, "int2" ]
+  EnvironmentQa2:
+    !Equals [ !Ref EnvironmentType, "qa2" ]    
+
+Resources:
+  ASGInstanceRotationRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "ASGInstanceRotationRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "DescribeASGPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "autoscaling:DescribeAutoScalingGroups"
+                  - "autoscaling:DescribeInstanceRefreshes"
+                  - "autoscaling:StartInstanceRefresh"
+                  - "elasticloadbalancing:DescribeTargetHealth"
+                Resource: "*"
+        - PolicyName: "dynamoDBPutPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "dynamodb:PutItem"
+                  - "dynamodb:UpdateItem"
+                  - "dynamodb:GetItem"
+                Resource: !Sub
+                  - 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}'
+                  - TableName: !ImportValue ASGRefreshMonitorTableName  
+
+        - PolicyName: "s3GetObjectPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: "s3:GetObject"
+                Resource:
+                  !Sub 
+                    - "arn:aws:s3:::${BucketName}/*"
+                    - BucketName: !FindInMap [ EnvironmentToBucket, !Ref EnvironmentType, BucketName ]
+
+              - Effect: "Allow"
+                Action: "s3:ListBucket"
+                Resource:
+                  !Sub 
+                    - "arn:aws:s3:::${BucketName}"
+                    - BucketName: !FindInMap [ EnvironmentToBucket, !Ref EnvironmentType, BucketName ]
+
+  ASGInstanceRotationStateMachineRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "ASGInstanceRotationStateMachineRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "states.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "InvokeLambdasPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource:
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:Split_ASG_into_Batches:*'   
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:Split_ASG_into_Batches'                         
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:Start_refresh_lambda:*'   
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:Start_refresh_lambda' 
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:Check_refresh_status_lambda:*'   
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:Check_refresh_status_lambda'                                      
+
+  SplitASGIntoBatches:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      FunctionName: "Split_ASG_into_Batches"
+      CodeUri: split_ASG_into_Batches/
+      Handler: "app.lambda_handler"
+      Role: !GetAtt ASGInstanceRotationRole.Arn
+      Runtime: "python3.12"
+      Timeout: 300
+      Environment:
+        Variables:
+          ASG_NAME_SUFFIX: "-AutoScalingGroup"    
+          S3_BUCKET_NAME: !FindInMap [ EnvironmentToBucket, !Ref EnvironmentType, BucketName ] 
+          S3_KEY_NAME: 'service-mapping.yaml'
+          TARGET_ENVIRONMENT: !Ref EnvironmentType      
+
+  StartRefreshLambda:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      FunctionName: "Start_refresh_lambda"
+      CodeUri: start_refresh_lambda/
+      Handler: "app.lambda_handler"
+      Role: !GetAtt ASGInstanceRotationRole.Arn
+      Runtime: "python3.12"
+      Timeout: 300
+      Environment:
+        Variables:
+          ASG_REFRESH_MONITOR_TABLE: !ImportValue ASGRefreshMonitorTableName     
+
+  CheckRefreshStatusLambda:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      FunctionName: "Check_refresh_status_lambda"
+      CodeUri: check_refresh_status_lambda/
+      Handler: "app.lambda_handler"
+      Role: !GetAtt ASGInstanceRotationRole.Arn
+      Runtime: "python3.12"    
+      Timeout: 300
+      Environment:
+        Variables:
+          ASG_REFRESH_MONITOR_TABLE: !ImportValue ASGRefreshMonitorTableName      
+
+  InstanceRotationStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: state_machine/definition.json
+      Role: !GetAtt ASGInstanceRotationStateMachineRole.Arn
+      DefinitionSubstitutions:
+        SplitASGIntoBatchesArn: !GetAtt SplitASGIntoBatches.Arn
+        StartRefreshLambdaArn: !GetAtt StartRefreshLambda.Arn
+        CheckStatusLambdaArn: !GetAtt CheckRefreshStatusLambda.Arn      

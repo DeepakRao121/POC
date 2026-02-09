@@ -1,0 +1,149 @@
+{
+	"Comment": "ASG Instance Refresh Step Function with batching and Timeout",
+	"StartAt": "SplitIntoBatches",
+	"States": {
+		"SplitIntoBatches": {
+			"Type": "Task",
+			"Resource": "${SplitASGIntoBatchesArn}",
+			"Next": "ProcessBatches",
+			"ResultPath": "$.batches"
+		},
+		"ProcessBatches": {
+			"Type": "Map",
+			"ItemsPath": "$.batches.asg_batches",
+			"MaxConcurrency": 1,
+			"Iterator": {
+				"StartAt": "RotateBatch",
+				"States": {
+					"RotateBatch": {
+						"Type": "Map",
+						"ItemsPath": "$",
+						"MaxConcurrency": 10,
+						"Iterator": {
+							"StartAt": "StartRefresh",
+							"States": {
+								"StartRefresh": {
+									"Type": "Task",
+									"Resource": "${StartRefreshLambdaArn}",
+									"Parameters": {
+										"asg_name.$": "$"
+									},
+									"Next": "CheckIfSkipped",
+									"Catch": [
+										{
+											"ErrorEquals": [
+												"States.ALL"
+											],
+											"ResultPath": "$.error",
+											"Next": "MarkFailure"
+										}
+									]
+								},
+								"CheckIfSkipped": {
+									"Type": "Choice",
+									"Choices": [
+										{
+											"Variable": "$.skip",
+											"BooleanEquals": true,
+											"Next": "MarkSuccess"
+										}
+									],
+									"Default": "InitializeCounter"
+								},
+								"InitializeCounter": {
+									"Type": "Pass",
+									"Parameters": {
+										"check_count": 0,
+										"max_checks": 45
+									},
+									"ResultPath": "$.status_check_counter",
+									"Next": "CheckStatus"
+								},
+								"CheckStatus": {
+									"Type": "Task",
+									"Resource": "${CheckStatusLambdaArn}",
+									"ResultPath": "$.refresh_status_check",
+									"Next": "EvaluateStatus"
+								},
+								"EvaluateStatus": {
+									"Type": "Choice",
+									"Choices": [
+										{
+											"Variable": "$.refresh_status_check.status",
+											"StringEquals": "Successful",
+											"Next": "MarkSuccess"
+										},
+										{
+											"Variable": "$.refresh_status_check.status",
+											"StringEquals": "Failed",
+											"Next": "MarkFailure"
+										},
+										{
+											"Variable": "$.refresh_status_check.status",
+											"StringEquals": "Cancelled",
+											"Next": "MarkFailure"
+										}
+									],
+									"Default": "WaitAndCheckAgain"
+								},
+								"WaitAndCheckAgain": {
+									"Type": "Wait",
+									"Seconds": 60,
+									"Next": "IncrementCounter"
+								},
+								"IncrementCounter": {
+									"Type": "Pass",
+									"Parameters": {
+										"check_count.$": "States.MathAdd($.status_check_counter.check_count, 1)",
+										"max_checks.$": "$.status_check_counter.max_checks"
+									},
+									"ResultPath": "$.status_check_counter",
+									"Next": "CheckCounter"
+								},
+								"CheckCounter": {
+									"Type": "Choice",
+									"Choices": [
+										{
+											"Variable": "$.status_check_counter.check_count",
+											"NumericLessThan": 45,
+											"Next": "CheckStatus"
+										}
+									],
+									"Default": "MarkTimeoutFailure"
+								},
+								"MarkTimeoutFailure": {
+									"Type": "Pass",
+									"Result": {
+										"success": false,
+										"error": "ASG refresh status check timed out after 45 minutes"
+									},
+									"ResultPath": "$.result",
+									"End": true
+								},
+								"MarkSuccess": {
+									"Type": "Pass",
+									"Result": {
+										"success": true
+									},
+									"ResultPath": "$.result",
+									"End": true
+								},
+								"MarkFailure": {
+									"Type": "Pass",
+									"Result": {
+										"success": false,
+										"error.$": "States.Format('ASG refresh failed with status: {}', $.refresh_status_check.status)"
+									},
+									"ResultPath": "$.result",
+									"End": true
+								}
+							}
+						},
+						"End": true
+					}
+				}
+			},
+			"End": true
+		}
+	}
+}
